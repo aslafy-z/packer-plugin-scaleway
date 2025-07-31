@@ -139,3 +139,38 @@ func (c *ImageCheck) Check(ctx context.Context) error {
 
 	return nil
 }
+
+var _ tester.PackerCheck = (*NoImageCheck)(nil)
+
+type NoImageCheck struct {
+	zone      scw.Zone
+	imageName string
+}
+
+func (c *NoImageCheck) Check(ctx context.Context) error {
+	testCtx := tester.ExtractCtx(ctx)
+	api := instance.NewAPI(testCtx.ScwClient)
+
+	resp, err := api.ListImages(&instance.ListImagesRequest{
+		Name:    &c.imageName,
+		Zone:    c.zone,
+		Project: &testCtx.ProjectID,
+	}, scw.WithAllPages(), scw.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("failed to list images: %w", err)
+	}
+
+	if len(resp.Images) != 0 {
+		return fmt.Errorf("expected 0 images with name %s, got %d", c.imageName, len(resp.Images))
+	}
+
+	return nil
+}
+
+// NoImage checks that the current project does not contain any image with the given name
+func NoImage(zone scw.Zone, name string) *NoImageCheck {
+	return &NoImageCheck{
+		zone:      zone,
+		imageName: name,
+	}
+}

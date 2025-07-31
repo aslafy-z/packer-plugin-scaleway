@@ -97,3 +97,34 @@ func Test(t *testing.T, config *TestConfig) {
 	t.Logf("Deleting tmp dir: %s", tmpDir)
 	require.NoError(t, os.RemoveAll(tmpDir), "failed to remote tmp dir %s", tmpDir)
 }
+
+func TestWithFailure(t *testing.T, config *TestConfig) {
+	httpClient, cleanup, err := vcr.GetHTTPRecorder(vcr.GetTestFilePath(t, "."), vcr.UpdateCassettes)
+	require.NoError(t, err)
+	defer cleanup()
+
+	ctx := t.Context()
+	ctx, err = NewTestContext(ctx, httpClient)
+	require.NoError(t, err)
+
+	// Create TMP Dir
+	tmpDir := t.TempDir()
+	require.NoError(t, err)
+	t.Logf("Created tmp dir: %s", tmpDir)
+
+	err = packerExec(tmpDir, config.Config, !vcr.UpdateCassettes)
+	require.Error(t, err, "packer command should have failed but did not")
+
+	for i, check := range config.Checks {
+		t.Logf("Running check %d/%d", i+1, len(config.Checks))
+
+		err := check.Check(ctx)
+		if err != nil {
+			t.Fail()
+			t.Errorf("Packer check %d failed: %s", i+1, err.Error())
+		}
+	}
+
+	t.Logf("Deleting tmp dir: %s", tmpDir)
+	require.NoError(t, os.RemoveAll(tmpDir), "failed to remote tmp dir %s", tmpDir)
+}
