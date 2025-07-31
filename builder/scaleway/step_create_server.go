@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/packer-plugin-sdk/multistep"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
+	"github.com/scaleway/packer-plugin-scaleway/internal/httperrors"
 	block "github.com/scaleway/scaleway-sdk-go/api/block/v1alpha1"
 	"github.com/scaleway/scaleway-sdk-go/api/instance/v1"
 	"github.com/scaleway/scaleway-sdk-go/scw"
@@ -164,8 +165,33 @@ func (s *stepCreateServer) Cleanup(state multistep.StateBag) {
 		return
 	}
 
+	c := state.Get("config").(*Config)
 	instanceAPI := instance.NewAPI(state.Get("client").(*scw.Client))
 	ui := state.Get("ui").(packersdk.Ui)
+
+	if c.RemoveVolume {
+		ui.Say("Cleaning up root volume...")
+
+		server, err := instanceAPI.GetServer(&instance.GetServerRequest{
+			ServerID: s.serverID,
+			Zone:     scw.Zone(c.Zone),
+		})
+
+		if err != nil {
+			// If server is gone, do nothing
+			if !httperrors.Is404(err) {
+				ui.Error(fmt.Sprintf("failed to get server %s for volume cleanup: %s", s.serverID, err))
+			}
+		} else {
+			if rootVolume, ok := server.Server.Volumes["0"]; ok {
+				blockAPI := block.NewAPI(state.Get("client").(*scw.Client))
+				err := waitAndDeleteBlockVolume(blockAPI, scw.Zone(c.Zone), rootVolume.ID)
+				if err != nil {
+					ui.Error(fmt.Sprintf("failed to delete root volume %s: %s", rootVolume.ID, err))
+				}
+			}
+		}
+	}
 
 	ui.Say("Destroying server...")
 

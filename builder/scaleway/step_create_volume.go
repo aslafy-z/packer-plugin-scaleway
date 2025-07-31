@@ -97,6 +97,10 @@ func (s *stepCreateVolume) Cleanup(state multistep.StateBag) {
 
 	volumes := state.Get("volumes").([]*instance.VolumeServer)
 	for _, volume := range volumes {
+		if volume.Boot {
+			continue
+		}
+
 		err := waitAndDeleteInstanceVolume(instanceAPI, scw.Zone(c.Zone), volume.ID)
 		if err != nil && !httperrors.Is404(err) {
 			err := fmt.Errorf("error removing block volume %s: %w", volume.ID, err)
