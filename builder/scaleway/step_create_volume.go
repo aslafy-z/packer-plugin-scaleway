@@ -65,26 +65,22 @@ func (s *stepCreateVolume) Cleanup(state multistep.StateBag) {
 
 	blockAPI := block.NewAPI(state.Get("client").(*scw.Client))
 
-	_, serverWasCreated := state.GetOk("server_id")
-	createdVolumesI, createdVolumesExists := state.GetOk("created_volumes")
+	if _, imageCreated := state.GetOk("snapshots"); !imageCreated {
+		// The build failed before the image was created. stepCreateServer.Cleanup
+		// already deleted the server, so wait for the volumes this step created
+		// to be detached, then delete them. A kept server still uses them.
+		createdVolumesI, createdVolumesExists := state.GetOk(StateKeyCreatedVolumes)
+		if !createdVolumesExists || c.KeepServer {
+			return
+		}
 
-	if !serverWasCreated && createdVolumesExists {
-		// If server was not created, we need to clean up manually created volumes
-		createdVolumes := createdVolumesI.([]*instance.VolumeServerTemplate)
-		for _, volume := range createdVolumes {
-			err := blockAPI.DeleteVolume(&block.DeleteVolumeRequest{
-				Zone:     scw.Zone(c.Zone),
-				VolumeID: *volume.ID,
-			})
-			if err != nil {
+		for _, volume := range createdVolumesI.([]*instance.VolumeServerTemplate) {
+			err := waitAndDeleteBlockVolume(blockAPI, scw.Zone(c.Zone), *volume.ID)
+			if err != nil && !httperrors.Is404(err) {
 				ui.Error(fmt.Sprintf("failed to cleanup block volume %s: %s", *volume.ID, err))
 			}
 		}
-	}
 
-	if _, ok := state.GetOk("snapshots"); !ok {
-		// volume will be detached from server only after snapshotting ... so we don't
-		// need to remove volume before snapshot step.
 		return
 	}
 
