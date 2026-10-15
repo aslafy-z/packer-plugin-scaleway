@@ -41,6 +41,9 @@ func (s *stepCreateVolume) Run(ctx context.Context, state multistep.StateBag) mu
 
 		volume, err := blockAPI.CreateVolume(req, scw.WithContext(ctx))
 		if err != nil {
+			// Let Cleanup remove the volumes created so far.
+			state.Put(StateKeyCreatedVolumes, volumeTemplates)
+
 			return putErrorAndHalt(state, ui, err)
 		}
 
@@ -63,14 +66,25 @@ func (s *stepCreateVolume) Cleanup(state multistep.StateBag) {
 		return
 	}
 
+	if _, serverExists := state.GetOk("server_id"); serverExists {
+		// stepCreateServer.Cleanup removes server_id once the server is
+		// deleted: the server was kept, or could not be deleted, and still
+		// holds the volumes.
+		if !c.KeepServer {
+			ui.Error("The server was not destroyed, its volumes are kept and need manual removal")
+		}
+
+		return
+	}
+
 	blockAPI := block.NewAPI(state.Get("client").(*scw.Client))
 
 	if _, imageCreated := state.GetOk("snapshots"); !imageCreated {
-		// The build failed before the image was created. stepCreateServer.Cleanup
-		// already deleted the server, so wait for the volumes this step created
-		// to be detached, then delete them. A kept server still uses them.
+		// The build failed before the image was created: wait for the volumes
+		// this step created to be detached from the deleted server, if any,
+		// then delete them.
 		createdVolumesI, createdVolumesExists := state.GetOk(StateKeyCreatedVolumes)
-		if !createdVolumesExists || c.KeepServer {
+		if !createdVolumesExists {
 			return
 		}
 

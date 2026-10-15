@@ -78,8 +78,11 @@ func (s *stepCreateServer) Run(ctx context.Context, state multistep.StateBag) mu
 	}
 
 	// Track the server as soon as it exists so that every later halt
-	// destroys it in Cleanup.
+	// destroys it in Cleanup. server_id stays in the state until Cleanup
+	// deletes the server, which tells stepCreateVolume.Cleanup whether a
+	// server still holds its volumes.
 	s.serverID = createServerResp.Server.ID
+	state.Put("server_id", s.serverID)
 
 	err = c.RootVolume.PostServerCreationSetup(block.NewAPI(state.Get("client").(*scw.Client)), createServerResp.Server)
 	if err != nil {
@@ -123,7 +126,6 @@ func (s *stepCreateServer) Run(ctx context.Context, state multistep.StateBag) mu
 		return putErrorAndHalt(state, ui, fmt.Errorf("server %s is %s instead of running", server.ID, server.State))
 	}
 
-	state.Put("server_id", createServerResp.Server.ID)
 	// instance_id is the generic term used so that users can have access to the
 	// instance id inside the provisioners, used in step_provision.
 	state.Put("instance_id", s.serverID)
@@ -132,42 +134,47 @@ func (s *stepCreateServer) Run(ctx context.Context, state multistep.StateBag) mu
 }
 
 func (s *stepCreateServer) Cleanup(state multistep.StateBag) {
-	if s.serverID == "" || state.Get("config").(*Config).KeepServer {
+	c := state.Get("config").(*Config)
+	if s.serverID == "" || c.KeepServer {
 		return
 	}
 
 	client := state.Get("client").(*scw.Client)
 	instanceAPI := instance.NewAPI(client)
 	ui := state.Get("ui").(packersdk.Ui)
-	c := state.Get("config").(*Config)
 	zone := scw.Zone(c.Zone)
 
 	// Once the image exists, stepCreateVolume.Cleanup removes every server
-	// volume. Before that, the root volume was created with the server and
-	// nothing else removes it.
-	var rootVolume *instance.VolumeServer
+	// volume. Before that, the volumes created along with the server (root
+	// volume, extra volumes of the source image) are removed here, and
+	// stepCreateVolume.Cleanup removes the block volumes it created.
+	var serverVolumes []*instance.VolumeServer
 
-	if _, imageCreated := state.GetOk("snapshots"); !imageCreated && c.RemoveVolume {
-		resp, err := instanceAPI.GetServer(&instance.GetServerRequest{
+	if _, imageCreated := state.GetOk("snapshots"); !imageCreated {
+		// A halt can leave the server in a transient state (start timeout,
+		// cancellation) in which both delete and terminate are refused.
+		server, err := instanceAPI.WaitForServer(&instance.WaitForServerRequest{
 			ServerID: s.serverID,
 			Zone:     zone,
 		})
 		if err != nil && !httperrors.Is404(err) {
-			ui.Error(fmt.Sprintf("Error fetching server %s, its root volume may need manual removal: %s", s.serverID, err))
+			ui.Error(fmt.Sprintf("Error waiting for server %s to settle, its volumes may need manual removal: %s", s.serverID, err))
 		}
 
-		if err == nil {
-			rootVolume = resp.Server.Volumes["0"]
+		if err == nil && c.RemoveVolume {
+			serverVolumes = volumesCreatedWithServer(state, server)
 		}
 	}
 
 	ui.Say("Destroying server...")
 
+	terminated := false
+
 	deleteErr := instanceAPI.DeleteServer(&instance.DeleteServerRequest{
 		ServerID: s.serverID,
 		Zone:     zone,
 	})
-	if deleteErr != nil {
+	if deleteErr != nil && !httperrors.Is404(deleteErr) {
 		_, err := instanceAPI.ServerAction(&instance.ServerActionRequest{
 			Action:   instance.ServerActionTerminate,
 			ServerID: s.serverID,
@@ -180,25 +187,56 @@ func (s *stepCreateServer) Cleanup(state multistep.StateBag) {
 
 			return
 		}
+
+		terminated = true
 	}
 
-	if rootVolume == nil {
-		return
+	state.Remove("server_id")
+
+	for _, volume := range serverVolumes {
+		isLocal := volume.VolumeType == instance.VolumeServerVolumeTypeLSSD ||
+			volume.VolumeType == instance.VolumeServerVolumeTypeScratch
+		if terminated && isLocal {
+			// terminate deletes local volumes along with the server.
+			continue
+		}
+
+		ui.Say(fmt.Sprintf("Removing volume %s...", volume.ID))
+
+		var err error
+		if volume.VolumeType == instance.VolumeServerVolumeTypeSbsVolume {
+			// Waits for the volume to be detached from the deleted server.
+			err = waitAndDeleteBlockVolume(block.NewAPI(client), zone, volume.ID)
+		} else {
+			err = waitAndDeleteInstanceVolume(instanceAPI, zone, volume.ID)
+		}
+
+		if err != nil && !httperrors.Is404(err) {
+			ui.Error(fmt.Sprintf("Error removing volume %s. Please remove it manually: %s", volume.ID, err))
+		}
+	}
+}
+
+// volumesCreatedWithServer returns the server volumes, except the block
+// volumes created by stepCreateVolume, which its own Cleanup removes.
+func volumesCreatedWithServer(state multistep.StateBag, server *instance.Server) []*instance.VolumeServer {
+	createdByStep := map[string]struct{}{}
+
+	if createdVolumes, ok := state.GetOk(StateKeyCreatedVolumes); ok {
+		for _, volume := range createdVolumes.([]*instance.VolumeServerTemplate) {
+			createdByStep[*volume.ID] = struct{}{}
+		}
 	}
 
-	ui.Say("Removing root volume...")
+	volumes := make([]*instance.VolumeServer, 0, len(server.Volumes))
 
-	var err error
-	if rootVolume.VolumeType == instance.VolumeServerVolumeTypeSbsVolume {
-		// Waits for the volume to be detached from the deleted server.
-		err = waitAndDeleteBlockVolume(block.NewAPI(client), zone, rootVolume.ID)
-	} else {
-		err = waitAndDeleteInstanceVolume(instanceAPI, zone, rootVolume.ID)
+	for _, volume := range server.Volumes {
+		if _, ok := createdByStep[volume.ID]; !ok {
+			volumes = append(volumes, volume)
+		}
 	}
 
-	if err != nil && !httperrors.Is404(err) {
-		ui.Error(fmt.Sprintf("Error removing root volume %s. Please remove it manually: %s", rootVolume.ID, err))
-	}
+	return volumes
 }
 
 // startServer powers the server on and waits for it to settle in a terminal
@@ -210,7 +248,7 @@ func startServer(ctx context.Context, instanceAPI *instance.API, c *Config, serv
 		Zone:     scw.Zone(c.Zone),
 	}, scw.WithContext(ctx))
 	if err != nil {
-		return nil, fmt.Errorf("error starting server: %w", err)
+		return nil, fmt.Errorf("error starting server: %w", formatInstanceError(err))
 	}
 
 	server, err := instanceAPI.WaitForServer(&instance.WaitForServerRequest{

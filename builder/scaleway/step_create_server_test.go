@@ -22,15 +22,18 @@ import (
 const (
 	fakeServerID     = "11111111-1111-1111-1111-111111111111"
 	fakeRootVolumeID = "22222222-2222-2222-2222-222222222222"
+	fakeBlockVolume  = "33333333-3333-3333-3333-333333333333"
+	fakeBlockPath    = "/block/v1alpha1/zones/fr-par-1/volumes/"
 	fakeZonePath     = "/instance/v1/zones/fr-par-1"
 )
 
 // fakeInstanceAPI mimics a server whose first poweron is accepted then fails
 // asynchronously, while later poweron calls are rejected as out of stock.
 type fakeInstanceAPI struct {
-	mu       sync.Mutex
-	poweron  int
-	requests []string
+	mu         sync.Mutex
+	poweron    int
+	requests   []string
+	unexpected []string
 }
 
 func (f *fakeInstanceAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -77,13 +80,17 @@ func (f *fakeInstanceAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 
 		return
-	case "GET /block/v1alpha1/zones/fr-par-1/volumes/" + fakeRootVolumeID:
-		body = block.Volume{ID: fakeRootVolumeID, Status: block.VolumeStatusAvailable}
-	case "DELETE /block/v1alpha1/zones/fr-par-1/volumes/" + fakeRootVolumeID:
+	case "GET " + fakeBlockPath + fakeRootVolumeID, "GET " + fakeBlockPath + fakeBlockVolume:
+		body = block.Volume{ID: strings.TrimPrefix(r.URL.Path, fakeBlockPath), Status: block.VolumeStatusAvailable}
+	case "DELETE " + fakeBlockPath + fakeRootVolumeID, "DELETE " + fakeBlockPath + fakeBlockVolume:
 		w.WriteHeader(http.StatusNoContent)
 
 		return
 	default:
+		// Cleanup treats 404 as already deleted, so record the request for
+		// the test to fail on instead of letting it pass silently.
+		f.unexpected = append(f.unexpected, r.Method+" "+r.URL.Path)
+
 		w.WriteHeader(http.StatusNotFound)
 
 		body = map[string]string{"type": "not_found", "message": "unexpected request"}
@@ -94,8 +101,8 @@ func (f *fakeInstanceAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func TestStepCreateServerOutOfStockCleansUp(t *testing.T) {
-	t.Parallel()
+func newFakeState(t *testing.T, config *scaleway.Config) (*fakeInstanceAPI, *multistep.BasicStateBag) {
+	t.Helper()
 
 	api := &fakeInstanceAPI{}
 	ts := httptest.NewServer(api)
@@ -111,7 +118,15 @@ func TestStepCreateServerOutOfStockCleansUp(t *testing.T) {
 	state := new(multistep.BasicStateBag)
 	state.Put("client", client)
 	state.Put("ui", ui)
-	state.Put("config", &scaleway.Config{
+	state.Put("config", config)
+
+	return api, state
+}
+
+func TestStepCreateServerOutOfStockCleansUp(t *testing.T) {
+	t.Parallel()
+
+	api, state := newFakeState(t, &scaleway.Config{
 		Zone:                  scw.ZoneFrPar1.String(),
 		CommercialType:        "GP1-M",
 		Image:                 "ubuntu_focal",
@@ -146,5 +161,49 @@ func TestStepCreateServerOutOfStockCleansUp(t *testing.T) {
 
 	if strings.Index(got, "DELETE "+fakeZonePath) > strings.Index(got, "DELETE /block") {
 		t.Errorf("root volume must be deleted after the server, got:\n%s", got)
+	}
+
+	if len(api.unexpected) > 0 {
+		t.Errorf("unexpected requests:\n%s", strings.Join(api.unexpected, "\n"))
+	}
+}
+
+func TestStepCreateVolumeCleanupKeepServer(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		serverExists bool
+		wantDelete   bool
+	}{
+		"no server was created": {serverExists: false, wantDelete: true},
+		"kept server":           {serverExists: true, wantDelete: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api, state := newFakeState(t, &scaleway.Config{
+				Zone:         scw.ZoneFrPar1.String(),
+				RemoveVolume: true,
+				KeepServer:   true,
+			})
+
+			volumeID := fakeBlockVolume
+			state.Put(scaleway.StateKeyCreatedVolumes, []*instance.VolumeServerTemplate{{ID: &volumeID}})
+
+			if tc.serverExists {
+				state.Put("server_id", fakeServerID)
+			}
+
+			scaleway.NewStepCreateVolume().Cleanup(state)
+
+			deleted := strings.Contains(strings.Join(api.requests, "\n"), "DELETE "+fakeBlockPath+fakeBlockVolume)
+			if deleted != tc.wantDelete {
+				t.Errorf("block volume deleted: got %t, want %t, requests:\n%s", deleted, tc.wantDelete, strings.Join(api.requests, "\n"))
+			}
+
+			if len(api.unexpected) > 0 {
+				t.Errorf("unexpected requests:\n%s", strings.Join(api.unexpected, "\n"))
+			}
+		})
 	}
 }
